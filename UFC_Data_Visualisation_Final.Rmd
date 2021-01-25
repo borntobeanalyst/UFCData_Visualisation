@@ -1,0 +1,755 @@
+---
+title: "UFC Data Visualisation"
+author: "Group Study 14"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+      number_sections: true
+      highlight: haddock
+      theme: spacelab
+      toc: yes
+      toc_depth: 2
+      toc_float:
+        collapsed: false
+      fontzize: 10pt
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(janitor)
+library(fastDummies)
+library(GGally)
+library(lubridate)
+library(ggradar)
+require(Hmisc)
+require(digest)
+require(cluster)    
+require(factoextra) 
+library(gridExtra)
+library(fmsb)
+library(ggiraph)
+library(moonBook)
+library(reshape2)
+library(sjmisc)
+library(ggiraphExtra)
+library(scales)
+library(extrafont)
+library(ggplot2)
+
+```
+
+# Introduction: The Story Behind UFC
+
+
+
+# Data Cleaning and Processing
+
+```{r}
+data <- read_csv("data.csv")
+clean_names(data) 
+data <- data %>% 
+  mutate(women = ifelse(grepl("Women", weight_class), TRUE, FALSE))
+
+fight_data <- data %>% 
+  dplyr::select(1:9) 
+
+#Splitting into men and Women
+data_men <- data %>% 
+  subset(women == FALSE)
+data_women <- data %>% 
+  subset(women == TRUE)
+
+#Splitting data into Fight and Fighter Data
+blue_profile_data <- data_men %>% 
+  dplyr::select(Referee, date, location, starts_with("B_")) %>% 
+  mutate(color = "blue")
+  
+red_profile_data <- data_men %>% 
+  dplyr::select(Referee, date, location, starts_with("R_")) %>% 
+  mutate(color = "red")
+
+#Cleaning column names
+names(blue_profile_data) <- ifelse(grepl("B_", names(blue_profile_data)), substring(names(blue_profile_data), 3), names(blue_profile_data))
+
+names(red_profile_data) <- ifelse(grepl("R_", names(red_profile_data)), substring(names(red_profile_data), 3), names(red_profile_data))
+
+#Unifying the Fighter Datasets
+fighter_profile_data <- rbind(blue_profile_data, red_profile_data) %>%
+  mutate(Stance = as.factor(Stance)) %>% 
+  rename(win_by_ko_tko = `win_by_KO/TKO`,
+         total_time_fought_seconds = `total_time_fought(seconds)`)
+
+# Turning data relative to number of fights
+fighter_profile_data <- fighter_profile_data %>% 
+  mutate(win_by_Decision_Majority = win_by_Decision_Majority/wins,
+         win_by_Decision_Split = win_by_Decision_Split/wins,
+         win_by_Decision_Unanimous = win_by_Decision_Unanimous/wins,
+         win_by_Submission = win_by_Submission/wins,
+         win_by_ko_tko = win_by_ko_tko/wins,
+         win_by_TKO_Doctor_Stoppage = win_by_TKO_Doctor_Stoppage/wins
+         ) %>% 
+  mutate(win_by_ko_tko = win_by_ko_tko + win_by_TKO_Doctor_Stoppage,
+         win_by_Decision = win_by_Decision_Majority + win_by_Decision_Split + win_by_Decision_Unanimous) %>% 
+  dplyr::select(-win_by_Decision_Majority, -win_by_Decision_Split, -win_by_Decision_Unanimous, -win_by_TKO_Doctor_Stoppage)
+```
+
+# K-Means Clustering of Fighters
+
+```{r}
+#Scaling the Data:
+fighter_profile_data_reduced <- fighter_profile_data %>% 
+  dplyr::select(Referee, #Do not Remove!
+         date, #Do not Remove!
+         location, #Do not Remove!
+         fighter, #Do not Remove!
+         Reach_cms, #Please change parameters to be included in clustering here
+         Weight_lbs, 
+         ends_with("_att"), 
+         avg_REV, 
+         avg_PASS, 
+         avg_KD,
+         win_by_Decision,
+         win_by_ko_tko,
+         win_by_Submission
+         ) %>% 
+  #what do avg_REV, avg_PASS, avg_KD measure??
+  dplyr::select(-starts_with("avg_opp")) %>% 
+  dplyr::select(-avg_TOTAL_STR_att, -avg_DISTANCE_att, -avg_SIG_STR_att) %>% 
+  na.omit() #filtering all fighters with missing data
+
+fighter_profile_data_scaled <- fighter_profile_data_reduced %>% 
+  dplyr::select(-Referee, 
+         -date, 
+         -location,
+         -fighter)
+  
+fighter_profile_data_scaled <- data.frame(scale(fighter_profile_data_scaled))
+```
+
+```{r EDA}
+fighter_profile_data_scaled %>% 
+  ggcorr(method = c("pairwise", "pearson"), layout.exp = 3,label_round=2, label = TRUE,label_size = 2,hjust = 1)
+
+fviz_nbclust(fighter_profile_data_scaled, kmeans, method = "silhouette", k.max = 15) +
+  labs(subtitle = "Silhouette method")
+```
+
+```{r}
+model_km2 <- kmeans(fighter_profile_data_scaled, centers = 2, nstart = 50, iter.max = 100)
+model_km3 <- kmeans(fighter_profile_data_scaled, centers = 3, nstart = 50, iter.max = 100)
+model_km4 <- kmeans(fighter_profile_data_scaled, centers = 4, nstart = 50, iter.max = 100)
+model_km5 <- kmeans(fighter_profile_data_scaled, centers = 5, nstart = 50, iter.max = 100)
+```
+
+```{r}
+#add clusters to the data frame
+fighter_profile_data_scaled_withClusters <- mutate(fighter_profile_data_scaled, cluster = as.factor(model_km2$cluster))
+
+#First let's find the averages of the variables by cluster
+center_locations <- fighter_profile_data_scaled_withClusters %>% 
+  group_by(cluster) %>% 
+  summarize_at(vars(Reach_cms:win_by_Submission),mean)
+
+#Next I use gather to collect information together
+xa2 <- gather(center_locations, key = "variable", value = "value", -cluster, factor_key = TRUE)
+
+#Next I use ggplot to visualize centers
+knnCenters <- ggplot(xa2, aes(x = variable, y = value)) + 
+  geom_line(aes(color = cluster,group = cluster), linetype = "dashed",size=1) +
+  geom_point(size=2,shape=4) + 
+  geom_hline(yintercept=0) + 
+  ggtitle("K-means centers k=2") + 
+  labs(fill = "Cluster") + 
+  theme(text = element_text(size=10),
+        axis.text.x = element_text(angle=45,hjust=1),
+        legend.title=element_text(size=5),
+        legend.text = element_text(size=5)
+  )
+knnCenters
+
+fviz_cluster(model_km2, fighter_profile_data_scaled, palette = "Set2", ggtheme = theme_minimal())
+
+```
+
+```{r}
+#add clusters to the data frame
+fighter_profile_data_scaled_withClusters <- mutate(fighter_profile_data_scaled, cluster = as.factor(model_km4$cluster))
+
+#Your code here
+#First let's find the averages of the variables by cluster
+center_locations <- fighter_profile_data_scaled_withClusters %>% 
+  group_by(cluster) %>% 
+  summarize_at(vars(Reach_cms:win_by_Submission),mean)
+
+#Next I use gather to collect information together
+xa4 <- gather(center_locations, key = "variable", value = "value", -cluster, factor_key = TRUE)
+
+#Next I use ggplot to visualize centers
+knnCenters <- ggplot(xa4, aes(x = variable, y = value)) + 
+  geom_line(aes(color = cluster,group = cluster), linetype = "dashed",size=1) +
+  geom_point(size=2,shape=4) + 
+  geom_hline(yintercept=0) + 
+  ggtitle("K-means centers k=4") + 
+  labs(fill = "Cluster") + 
+  theme(text = element_text(size=10),
+        axis.text.x = element_text(angle=45,hjust=1),
+        legend.title=element_text(size=5),
+        legend.text = element_text(size=5)
+  )
+knnCenters
+
+fviz_cluster(model_km4, fighter_profile_data_scaled, palette = "Set2", ggtheme = theme_minimal())
+
+```
+
+```{r}
+model_km2$size #3016 3626
+model_km3$size #2300 2339 2003
+model_km4$size #2052 1426 1460 1704
+model_km5$size #1387 1215 1513 1356 1171
+```
+
+```{r}
+g2 <- fviz_cluster(model_km2, fighter_profile_data_scaled, palette = "Set2", ggtheme = theme_minimal())
+g3 <- fviz_cluster(model_km3, fighter_profile_data_scaled, palette = "Set2", ggtheme = theme_minimal())
+g4 <- fviz_cluster(model_km4, fighter_profile_data_scaled, palette = "Set2", ggtheme = theme_minimal())
+g5 <- fviz_cluster(model_km5, fighter_profile_data_scaled, palette = "Set2", ggtheme = theme_minimal())
+grid.arrange(g2,g3,g4,g5)
+```
+
+##Combining the Data
+
+The following code integrates the cluster in the original fighter-dataframe
+
+```{r}
+fighter_profile_data_reduced_withClusters <- mutate(fighter_profile_data_reduced, cluster = as.factor(model_km4$cluster)) 
+
+temp <- fighter_profile_data_reduced_withClusters %>% 
+  dplyr::select(Referee, date, location, fighter, cluster)
+
+fighter_profile_data <- fighter_profile_data %>% 
+  left_join(temp, by = c("fighter", "location", "date", "Referee")) %>% 
+  mutate(new_fighter = ifelse(is.na(total_time_fought_seconds), 1,0),
+         vet_but_no_wins = ifelse(!is.na(total_time_fought_seconds) & wins==0, 1, 0))
+```
+
+This is a sanity check. The function should always output 0: 
+
+```{r}
+length(fighter_profile_data$date[is.na(cluster)& fighter_profile_data$new_fighter==0&fighter_profile_data$vet_but_no_wins==0])
+```
+
+
+
+```{r}
+total_fight_data <- read_delim("raw_total_fight_data.csv", delim = ";")
+clean_names(total_fight_data)
+
+total_fight_data <- total_fight_data %>% 
+  mutate(date = mdy(date)) %>% 
+  dplyr::select(-Winner, -Fight_type) %>% 
+  left_join(fight_data, by = c("R_fighter", "B_fighter", "Referee", "date", "location")) %>% 
+  mutate(women = ifelse(grepl("Women", weight_class), TRUE, FALSE))
+
+total_fight_data_men <- total_fight_data %>% 
+  subset(women == FALSE)
+
+total_fight_data_women <- total_fight_data %>% 
+  subset(women == TRUE)
+
+
+```
+
+```{r}
+total_fight_data_men$R_cluster <- NA
+total_fight_data_men$B_cluster <- NA
+
+total_fight_data_men$R_cluster <- fighter_profile_data$cluster[match(paste(total_fight_data_men$location, total_fight_data_men$Referee, total_fight_data_men$date, total_fight_data_men$R_fighter), paste(fighter_profile_data$location, fighter_profile_data$Referee, fighter_profile_data$date, fighter_profile_data$fighter))]
+
+total_fight_data_men$B_cluster <- fighter_profile_data$cluster[match(paste(total_fight_data_men$location, total_fight_data_men$Referee, total_fight_data_men$date, total_fight_data_men$B_fighter), paste(fighter_profile_data$location, fighter_profile_data$Referee, fighter_profile_data$date, fighter_profile_data$fighter))]
+
+sum(is.na(total_fight_data_men$R_cluster)) #1141
+sum(is.na(total_fight_data_men$B_cluster)) #1877
+#3018
+
+sum(is.na(fighter_profile_data$cluster)) #3014
+```
+```{r include=FALSE}
+OPENCAGE_KEY="b240e0f7a927441ba1b345dae97c1ba5"
+```
+
+```{r}
+library(maps)
+library(maptools)   #mapping: plotting
+library(rgeos)      #mapping: simplifying geometry
+library(rgdal)      #mapping: projecting
+library(spdep)      #Moran's I, Geary's C, poly2nb
+library(rnaturalearth)
+library(ggmap)
+library(opencage)
+library(sf)
+library(gganimate)
+library(hrbrthemes)
+
+map_data <- total_fight_data_men %>% 
+  group_by(location) %>% 
+  summarise(count = n(),
+         first_fight = min(date))
+
+latitudes <- numeric(0)
+longitudes <- numeric(0)
+locations <- map_data$location
+
+for (i in locations){
+   temp = opencage_forward(i, key = OPENCAGE_KEY)
+   lat = median(temp$results$geometry.lat)
+   lng = median(temp$results$geometry.lng)
+   latitudes[i] = lat
+   longitudes[i] = lng
+}
+
+map_data <- map_data %>% 
+  mutate(lat = latitudes,
+         lng = longitudes)
+
+world <- ne_countries(scale = "medium", returnclass = "sf") %>% 
+  filter(name != "Antarctica")
+
+plt <- ggplot(world) +
+  geom_sf() +
+  geom_point(data=map_data,
+             aes(x=lng,
+                 y=lat,
+                 size=count,
+                 color=first_fight,
+                 group = seq_along(first_fight)))+
+  labs(title = "The History of UFC: How fights have expanded globally over time")+
+  theme(text=element_text(size = 13, family="Tahoma"))+
+  transition_reveal(first_fight) +
+  shadow_mark(alpha = 0.3, size = 0.5)
+  
+plt
+```
+
+
+```{r}
+#Plot a distribution curve of how long each fight lasted, split by round format
+# add last round time, total fight time
+total_fight_data_men <- total_fight_data_men %>% 
+  mutate(last_round_time = as.character(last_round_time),
+         last_round_time = gsub('.{3}$', '', last_round_time),
+         last_round_time = ms(last_round_time),
+         total_fight_time = (last_round-1)*ms("05:00")+last_round_time,
+         total_fight_time_sec = seconds(total_fight_time))
+
+# total time = (last_round - 1) * 5 + (last_round time)
+density_data <- total_fight_data_men %>% 
+  mutate(no_of_rounds = as.factor(no_of_rounds))
+
+vertical.lines <- c(300,600,900,1200,1500)
+density <- ggplot(density_data, aes(x = total_fight_time_sec, color = no_of_rounds, fill = no_of_rounds)) + geom_density(alpha = 0.9) + geom_vline(xintercept = vertical.lines, linetype = "dotted", color = "orange", size = 0.5) +
+  labs(title = "How long do the fights of different formats last?", x = "Fight Time (sec)", y = "Density", fill = "Round Format", color = "Round Format")+
+  theme_light()+
+  scale_fill_brewer(palette = "Accent")+
+  scale_color_brewer(palette = "Accent")+
+  theme(text=element_text(family="Tahoma"))
+density
+
+```
+
+
+We now have 2 table: 
+
+`total_fight_data_men` containing information on the fights.
+`fighter_profile_data` containing information on the fighters (incl. the outcome of the clustering)
+
+The two tables can be linked using the `Referee`, `location`, `date` and `fighter` column(s). 
+
+ToDO:
+
+*Parsing of columns in the total_fight_data table (eg. getting rid of "of"s in some columns)
+
+
+## Visualizations
+
+```{r}
+# GGRadar Plot
+
+# Data Processing before making a plot
+cluster_radar <- center_locations %>% 
+  mutate_each(funs(rescale), -cluster) %>% 
+  rename("Arm Reach" = Reach_cms, "Weight(lbs)" = Weight_lbs, "Body" = avg_BODY_att, "Clinch" = avg_CLINCH_att, "Ground" = avg_GROUND_att,
+         "Head" = avg_HEAD_att, "Leg" = avg_LEG_att, "Sub" = avg_SUB_ATT, "TD" = avg_TD_att, "REV" = avg_REV, "PASS" = avg_PASS, 
+         "K/D" = avg_KD, "Decision" = win_by_Decision, "TKO or KO" = win_by_ko_tko, "Submission" = win_by_Submission) %>%
+  mutate(cluster = as.numeric(cluster))
+
+# rename clusters to our self-defined clusters
+cluster_radar[1, 1] <- "Heavy Fighters"
+cluster_radar[2, 1] <- "Submission Artists"
+cluster_radar[3, 1] <- "Wrestlers"
+cluster_radar[4, 1] <- "All-Rounders"
+
+glimpse(cluster_radar)
+
+# ggradar plot
+ggradar_plot <- cluster_radar %>% 
+  ggradar(font.radar = "Tahoma",
+        background.circle.colour = "#D7D6D1",
+        background.circle.transparency = 0.1,
+        plot.legend = if (nrow(cluster_radar) > 1) TRUE else FALSE,
+        legend.title = "Fighter Type",
+        legend.text.size = 10,
+        plot.title = "4 Clusters of UFC",
+        group.point.size = 3,
+        base.size = 14,
+        plot.extent.x.sf = 1,
+        plot.extent.y.sf = 1.2,
+        grid.label.size = 5,
+        axis.label.size = 3.5) #It would be nice if we can name the types of the fighters P!
+
+plot(ggradar_plot)
+
+# Individual Plots
+ggRadar_plot <- ggRadar(data = cluster_radar, aes(color = cluster),legend.position = "none", interactive = FALSE, size = 1, rescale = FALSE, use.label = TRUE)+
+  scale_y_discrete(breaks = NULL)+
+  ggtitle("Stat by Each UFC Fighter Types")+
+  theme(axis.text.x = element_text(size = 5))+
+  scale_color_brewer(palette = "Set2")+
+  scale_fill_brewer(palette = "Set2")+
+  theme(text=element_text(size=13, family="Tahoma"))+
+  facet_grid(~cluster)+
+  theme(axis.text.x = element_text(vjust = 50, angle = -90-360/15*(1:15)))
+
+plot(ggRadar_plot)
+
+```
+
+
+```{r}
+fighter_data <- fighter_profile_data %>%
+  dplyr::select(-Referee:-fighter) %>%
+  na.omit()
+
+fighter_data$Weight_lbs = as.factor(fighter_data$Weight_lbs)
+
+fighter_data$Weight_lbs <- fct_collapse(fighter_data$Weight_lbs,
+  '125' = ("125"),
+  '135' = ("135"),
+  '145' = ("145"),
+  '155' = ("155"),
+  '170' = c("168", "170"),
+  '185' = ("185"),
+  '205' = ("205"),
+  heavy = c("225", "230", "231", "234", "235", "238", "240", "242", "243", "245", "247", "249", "250", "253", "255", "258",
+             "260", "263", "264", "265"))
+
+
+f6 <- fighter_data %>%
+      group_by(cluster) %>%
+    dplyr::summarise(number=dplyr::n())
+
+f5 <- fighter_data %>%
+  group_by(cluster, Weight_lbs) %>%
+  dplyr::summarise(number=dplyr::n()) 
+
+
+for (i in 1:8){
+  f5$number[i] = f5$number[i]/2037
+}
+
+
+for (i in 9:16){
+  f5$number[i] = f5$number[i]/1406
+}
+
+
+for (i in 17:24){
+  f5$number[i] = f5$number[i]/1443
+}
+
+
+for (i in 25:32){
+  f5$number[i] = f5$number[i]/1664
+}
+
+
+ggplot(f5, aes(x = cluster, y =number)) + 
+geom_col(aes(fill = Weight_lbs))+
+  theme_bw()+
+  labs(title="Clusters and Weight Classes ",
+       subtitle = "What are the proportion of different weight classes in each cluster?", 
+       x = "Cluster Number",
+       y = "Proportion of fighters")+
+  theme(text=element_text(size=13, family="Tahoma"))+
+  scale_fill_brewer(palette = "Greens")
+  NULL
+
+
+
+
+
+f5$Weight_lbs = as.factor(f5$Weight_lbs)
+
+
+f5$Weight_lbs <- fct_collapse(f5$Weight_lbs,
+  '125' = ("125"),
+  '135' = ("135"),
+  '145' = ("145"),
+  '155' = ("155"),
+  '170' = c("168", "170"),
+  '185' = ("185"),
+  '205' = ("205"),
+  heavy = c("225", "230", "231", "234", "235", "238", "240", "242", "243", "245", "247", "249", "250", "253", "255", "258",
+             "260", "263", "264", "265"))
+
+
+
+f <- fighter_data %>%
+  group_by(Weight_lbs) %>%
+  dplyr::summarise(number=dplyr::n(),
+              win_by_ko_tko= sum(win_by_ko_tko),
+            win_by_Submission = sum(win_by_Submission),
+            win_by_Decision = sum(win_by_Decision)) 
+
+f$Weight_lbs = as.factor(f$Weight_lbs)
+
+
+f$Weight_lbs <- fct_collapse(f$Weight_lbs,
+  '125' = ("125"),
+  '135' = ("135"),
+  '145' = ("145"),
+  '155' = ("155"),
+  '170' = c("168", "170"),
+  '185' = ("185"),
+  '205' = ("205"),
+  heavy = c("225", "230", "231", "234", "235", "238", "240", "242", "243", "245", "247", "249", "250", "253", "255", "258",
+             "260", "263", "264", "265"))
+
+
+f1 <- f %>%
+  group_by(Weight_lbs) %>%
+  dplyr::summarise(number = sum(number),
+              win_by_ko_tko= sum(win_by_ko_tko),
+            win_by_Submission = sum(win_by_Submission),
+            win_by_Decision = sum(win_by_Decision)) 
+  
+
+for (i in 1:nrow(f1)){
+  f1$win_by_ko_tko[i] = f1$win_by_ko_tko[i]/f1$number[i]*100
+  f1$win_by_Submission[i] = f1$win_by_Submission[i]/f1$number[i]*100
+  f1$win_by_Decision[i] = f1$win_by_Decision[i]/f1$number[i]*100
+}
+
+```
+```{r}
+f1_long <- gather(f1, win_type, percentage, win_by_ko_tko:win_by_Decision, factor_key=TRUE)
+
+# Rename the values in the dataframe to make the legend more clear
+levels(f1_long$win_type)[levels(f1_long$win_type) == "win_by_ko_tko"] <- "Win by KO/TKO"
+levels(f1_long$win_type)[levels(f1_long$win_type) == "win_by_Submission"] <- "Win by Submission"
+levels(f1_long$win_type)[levels(f1_long$win_type) == "win_by_Decision"] <- "Win by Decision"
+
+
+ggplot(f1_long, aes(x = Weight_lbs, y =percentage)) + 
+geom_col(aes(fill = win_type))+
+  theme_bw()+
+  labs(title="Win Type",
+       subtitle = "Variation of win types between weigh classes", 
+       x = "Weight Class",
+       y = "Percentage of Wins",
+       fill = "Win Type")+
+  scale_fill_brewer(palette = "Paired")+
+  theme(text=element_text(family="Tahoma"))+
+  NULL
+
+```
+
+```{r}
+#Calculating summery data for the cluster matchups
+cluster_perfA <- total_fight_data_men %>% 
+  group_by(R_cluster, B_cluster, Winner) %>% 
+  summarise(fights = n()) 
+cluster_perfB <- total_fight_data_men %>% 
+  group_by(B_cluster, R_cluster, Winner) %>% 
+  summarise(fights = n())
+
+cluster_perfA <- cluster_perfA %>% 
+  spread(key = Winner, value = fights) 
+cluster_perfB <- cluster_perfB %>% 
+  spread(key = Winner, value = fights)
+
+library(tidyr)
+cluster_perfA$Draw <- tidyr::replace_na(cluster_perfA$Draw, 0) 
+cluster_perfB$Draw <- tidyr::replace_na(cluster_perfB$Draw, 0)
+
+cluster_perfA <- cluster_perfA %>% 
+  mutate(fights = Blue + Draw + Red) %>% 
+  rename(fighterCluster=R_cluster,
+         oppCluster=B_cluster,
+         Wins=Red,
+         Losses=Blue)
+cluster_perfB <- cluster_perfB %>% 
+  mutate(fights = Blue + Draw + Red) %>% 
+  rename(fighterCluster=B_cluster,
+         oppCluster=R_cluster,
+         Wins=Blue,
+         Losses=Red)
+
+cluster_perf_incl_draws <- cluster_perfA %>% 
+  left_join(cluster_perfB, by = c("fighterCluster", "oppCluster")) %>% 
+  summarise(fights = (fights.x + fights.y),
+            wins = (Wins.x + Wins.y),
+            losses = (Losses.x + Losses.y),
+            draws = (Draw.x + Draw.y)
+            ) %>% 
+  mutate(win_per = wins/fights,
+         draw_per = draws/fights)
+
+cluster_perf_excl_draws <- cluster_perfA %>% 
+  left_join(cluster_perfB, by = c("fighterCluster", "oppCluster")) %>% 
+  summarise(fights = (fights.x + fights.y - Draw.x - Draw.y),
+            wins = (Wins.x + Wins.y),
+            losses = (Losses.x + Losses.y)
+            ) %>% 
+  mutate(win_per = wins/fights)
+```
+
+```{r}
+#Create Heatmap for Wins
+dfWins <- cluster_perf_excl_draws %>% 
+  dplyr::select(-fights, -wins, -losses) %>% 
+  spread(key = oppCluster, value = win_per) 
+
+#dfWins[1, 3:6] = NA
+#dfWins[2, 4:6] = NA
+#dfWins[3, 5:6] = NA
+#dfWins[4, 6] = NA
+
+dfWins <- dfWins %>% 
+  gather(2:6, key = oppCluster, value = win_per)
+
+dfWins$fighterCluster <- ifelse(is.na(dfWins$fighterCluster), 'newFighter', dfWins$fighterCluster)
+dfWins$oppCluster <- ifelse(dfWins$oppCluster=="<NA>", 'newFighter', dfWins$oppCluster)
+
+dfWins <- dfWins %>% 
+  ungroup() %>% 
+  mutate(fighterCluster = factor(fighterCluster, levels = c(1,2,3,4,"newFighter"))) %>% 
+  group_by(fighterCluster) %>% 
+  mutate(oppCluster = factor(oppCluster, levels = c(1,2,3,4,"newFighter")))
+ 
+library(forcats)
+ggplot(dfWins, aes(x = oppCluster, y = fct_rev(fighterCluster), fill = win_per)) +
+  geom_tile()+
+  geom_text(aes(label=round(win_per, digits=2)))+
+  theme(text=element_text(size = 13, family="Tahoma"))+
+  labs(
+    title = "Heatmap for Probability of Win",
+    x = "Opponent Cluster",
+    y = "Fighter Cluster",
+    fill = "Probability of Win (%)"
+  )+
+  NULL
+```
+
+```{r}
+#Create Heatmap for Draws
+dfDraws <- cluster_perf_incl_draws %>% 
+  dplyr::select(-fights, -wins, -losses, -draws, -win_per) %>% 
+  spread(key = oppCluster, value = draw_per) 
+
+#dfDraws[1, 3:6] = NA
+#dfDraws[2, 4:6] = NA
+#dfDraws[3, 5:6] = NA
+#dfDraws[4, 6] = NA
+
+dfDraws <- dfDraws %>% 
+  gather(2:6, key = oppCluster, value = draw_per)
+
+dfDraws$fighterCluster <- ifelse(is.na(dfDraws$fighterCluster), 'newFighter', dfDraws$fighterCluster)
+dfDraws$oppCluster <- ifelse(dfDraws$oppCluster=="<NA>", 'newFighter', dfDraws$oppCluster)
+
+dfDraws <- dfDraws %>% 
+  ungroup() %>% 
+  mutate(fighterCluster = factor(fighterCluster, levels = c(1,2,3,4,"newFighter"))) %>% 
+  group_by(fighterCluster) %>% 
+  mutate(oppCluster = factor(oppCluster, levels = c(1,2,3,4,"newFighter")))
+ 
+ggplot(dfDraws, aes(x = oppCluster, y = fct_rev(fighterCluster), fill = draw_per)) +
+  geom_tile()+
+  geom_text(aes(label=round(draw_per, digits=3)))+
+  theme(text=element_text(size = 13, family="Tahoma"))+
+  labs(
+    title = "Heatmap for Probability of Draws",
+    x = "Opponent Cluster",
+    y = "Fighter Cluster",
+    fill = "Probability of Draws (%)"
+  )+
+  NULL
+```
+
+```{r}
+#Calculating summery data for average fight time
+cluster_timeA <- total_fight_data_men %>% 
+  filter(no_of_rounds==3) %>% #filter for modern standart duration only
+  group_by(R_cluster, B_cluster) %>% 
+  summarise(avg_length = mean(total_fight_time_sec),
+            fights = n()) %>% 
+  rename(fighterCluster=R_cluster,
+         oppCluster=B_cluster)
+cluster_timeB <- total_fight_data_men %>% 
+  filter(no_of_rounds==3) %>% #filter for modern standart duration only
+  group_by(B_cluster, R_cluster) %>% 
+  summarise(avg_length = mean(total_fight_time_sec),
+            fights = n()) %>% 
+  rename(fighterCluster=B_cluster,
+         oppCluster=R_cluster)
+
+cluster_time <- cluster_timeA %>% 
+  left_join(cluster_timeB, by = c("fighterCluster", "oppCluster")) %>% 
+  mutate(avg_length = ((avg_length.x * fights.x) + (avg_length.y * fights.y)) / (fights.x + fights.y),
+         fights = fights.x + fights.y) %>% 
+  dplyr::select(-avg_length.x, -fights.x, -avg_length.y, -fights.y)
+  
+
+dfTime <- cluster_time %>% 
+  dplyr::select(-fights) %>% 
+  spread(key = oppCluster, value = avg_length) 
+
+#dfTime[1, 3:6] = NA
+#dfTime[2, 4:6] = NA
+#dfTime[3, 5:6] = NA
+#dfTime[4, 6] = NA
+
+dfTime <- dfTime %>% 
+  gather(2:6, key = oppCluster, value = avg_length)
+
+dfTime$fighterCluster <- ifelse(is.na(dfTime$fighterCluster), 'newFighter', dfTime$fighterCluster)
+dfTime$oppCluster <- ifelse(dfTime$oppCluster=="<NA>", 'newFighter', dfTime$oppCluster)
+
+dfTime <- dfTime %>% 
+  ungroup() %>% 
+  mutate(fighterCluster = factor(fighterCluster, levels = c(1,2,3,4,"newFighter"))) %>% 
+  group_by(fighterCluster) %>% 
+  mutate(oppCluster = factor(oppCluster, levels = c(1,2,3,4,"newFighter"))) 
+
+dfTime$avg_length <- seconds(round(dfTime$avg_length))
+#dfTime$avg_length <- ms(dfTime$avg_length)
+ 
+ggplot(dfTime, aes(x = oppCluster, y = fct_rev(fighterCluster), fill = avg_length)) +
+  geom_tile()+
+  geom_text(aes(label=round(avg_length, digits=3)))+
+  theme(text=element_text(size = 13, family="Tahoma"))+
+  labs(
+    title = "Heatmap of Average Fight Time",
+    x = "Opponent Cluster",
+    y = "Fighter Cluster",
+    fill = "Avergae Fight Time (sec)"
+  )+
+  NULL
+```
